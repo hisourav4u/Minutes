@@ -134,8 +134,20 @@ final class Recorder: NSObject {
     }
 
     private func installMicTap() throws {
-        let format = engine.inputNode.outputFormat(forBus: 0)
-        guard format.sampleRate > 0 else { throw RecorderError.noInputDevice }
+        // Clear any tap left behind by a previous start/config-change — installing a
+        // second tap on a bus that already has one throws an ObjC exception that
+        // takes down the whole app (SIGABRT), which is not catchable in Swift.
+        engine.inputNode.removeTap(onBus: 0)
+
+        // Use the input node's *hardware* format, not outputFormat. When the default
+        // input device is unusable (none selected, an output-only device, a Bluetooth
+        // mic mid-switch), the format can come back with a valid sample rate but ZERO
+        // channels — installTap then throws. Guard both so we surface a clean error
+        // instead of crashing.
+        let format = engine.inputNode.inputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw RecorderError.noInputDevice
+        }
 
         engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) {
             [weak self] buffer, _ in
@@ -287,7 +299,7 @@ enum RecorderError: LocalizedError {
         case .noDisplay:
             return "No display found for system-audio capture. Check Screen Recording permission in System Settings → Privacy & Security."
         case .noInputDevice:
-            return "No microphone input device available."
+            return "No usable microphone was found. Pick an input device in System Settings → Sound → Input (or reconnect your mic), then try again."
         }
     }
 }
