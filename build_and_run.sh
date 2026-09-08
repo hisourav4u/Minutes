@@ -43,8 +43,17 @@ sed "s/\$(EXECUTABLE_NAME)/Minutes/g" \
 echo "App bundle assembled at $APP"
 
 # -- 3. Ad-hoc code signing ----------------------------------------------------
-echo "Signing..."
-codesign --force --deep --sign - "$APP"
+# Sign with a STABLE identity so macOS TCC (Microphone, Screen Recording) keeps
+# the grant across rebuilds. Ad-hoc signatures change every build and lose it.
+SIGN_ID="${MINUTES_SIGN_ID:-ClipboardManager Dev}"
+if security find-identity -v -p codesigning | grep -q "$SIGN_ID"; then
+    echo "Signing with stable identity: $SIGN_ID"
+    codesign --force --deep --sign "$SIGN_ID" "$APP"
+else
+    echo "WARNING: stable identity '$SIGN_ID' not found — ad-hoc signing."
+    echo "         Screen Recording / Mic permission will reset on every rebuild."
+    codesign --force --deep --sign - "$APP"
+fi
 echo "Signed"
 
 # -- 4. Launch -----------------------------------------------------------------
