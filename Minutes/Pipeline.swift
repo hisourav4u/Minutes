@@ -64,24 +64,45 @@ enum Pipeline {
 
     private static func transcribe(_ wav: URL, whisper: URL, model: URL) throws -> [(TimeInterval, TimeInterval, String)] {
         let outPrefix = wav.deletingPathExtension()
-        let p = Process()
-        p.executableURL = whisper
-        p.arguments = [
-            "-m", model.path,
-            "-f", wav.path,
-            "-l", "en",
-            "-oj",                      // JSON with per-segment offsets
-            "-of", outPrefix.path,
-            "-np",                      // no progress spam
-        ]
-        let sink = Pipe()
-        p.standardOutput = sink
-        p.standardError = sink
-        try p.run()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            let log = String(data: sink.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw PipelineError.whisperFailed(String(log.suffix(400)))
+
+        // whisper-cli occasionally wedges: it stalls at ~0% CPU and never exits,
+        // which used to hang the whole pipeline on waitUntilExit() forever. Bound
+        // each run by a generous deadline derived from the audio length (16 kHz
+        // mono int16 = 32 kB/s), kill a stalled run, and retry once before giving
+        // up with an error the app can surface.
+        let audioSeconds = (fileSize(wav) / 32_000).rounded()
+        let deadline = max(300, audioSeconds * 4)   // ~4x realtime; turbo runs well under 1x
+
+        var lastLog = ""
+        for attempt in 1...2 {
+            let p = Process()
+            p.executableURL = whisper
+            p.arguments = [
+                "-m", model.path,
+                "-f", wav.path,
+                "-l", "en",
+                "-oj",                      // JSON with per-segment offsets
+                "-of", outPrefix.path,
+                "-np",                      // no progress spam
+            ]
+            let sink = Pipe()
+            p.standardOutput = sink
+            p.standardError = sink
+            try p.run()
+
+            let finished = waitOrKill(p, timeout: deadline)
+            lastLog = String(data: sink.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+            if finished && p.terminationStatus == 0 { break }
+            if !finished {
+                lastLog = "whisper stalled past \(Int(deadline))s and was killed"
+                    + (attempt == 1 ? " — retrying once" : "")
+            }
+            if attempt == 2 {
+                throw PipelineError.whisperFailed(String(lastLog.suffix(400)))
+            }
+            // clean any partial output before the retry
+            try? FileManager.default.removeItem(at: outPrefix.appendingPathExtension("json"))
         }
 
         let jsonURL = outPrefix.appendingPathExtension("json")
@@ -93,6 +114,8 @@ enum Pipeline {
         else { throw PipelineError.whisperFailed("unexpected JSON shape") }
 
         var out: [(TimeInterval, TimeInterval, String)] = []
+        var runText = ""     // for the repetition-loop guard below
+        var runCount = 0
         for item in items {
             guard
                 let offsets = item["offsets"] as? [String: Any],
@@ -111,9 +134,38 @@ enum Pipeline {
                 if ["blank_audio", "silence", "music", "applause", "laughter",
                     "inaudible", "noise"].contains(bare) { continue }
             }
+            // Repetition-loop guard: on silence whisper hallucinates the same
+            // phrase over and over ("So yeah, I'm part of the world." x200).
+            // Keep the first occurrence, drop the rest of a same-text run.
+            let key = text.lowercased()
+            if key == runText {
+                runCount += 1
+                if runCount > 1 { continue }
+            } else {
+                runText = key
+                runCount = 0
+            }
             out.append((from / 1000, to / 1000, text))
         }
         return out
+    }
+
+    /// Waits for a process, but SIGKILLs it if it runs past `timeout`.
+    /// Returns true if it exited on its own, false if it was killed.
+    private static func waitOrKill(_ p: Process, timeout: TimeInterval) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in done.signal() }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            kill(p.processIdentifier, SIGKILL)
+            p.waitUntilExit()
+            return false
+        }
+        return true
+    }
+
+    private static func fileSize(_ url: URL) -> Double {
+        let n = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber
+        return n?.doubleValue ?? 0
     }
 
     // MARK: - merge
