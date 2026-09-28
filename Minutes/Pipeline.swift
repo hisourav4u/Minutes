@@ -71,7 +71,7 @@ enum Pipeline {
         // mono int16 = 32 kB/s), kill a stalled run, and retry once before giving
         // up with an error the app can surface.
         let audioSeconds = (fileSize(wav) / 32_000).rounded()
-        let deadline = max(300, audioSeconds * 4)   // ~4x realtime; turbo runs well under 1x
+        let deadline = max(300, audioSeconds * 2)   // ~2x realtime backstop; turbo runs well under 1x
 
         var lastLog = ""
         for attempt in 1...2 {
@@ -88,10 +88,26 @@ enum Pipeline {
             let sink = Pipe()
             p.standardOutput = sink
             p.standardError = sink
+
+            // Drain the pipe on a background thread WHILE whisper runs. Even
+            // with -np, whisper-cli prints the full transcript to stdout; if we
+            // wait to read until after it exits, its output fills the OS pipe
+            // buffer and whisper blocks on write() forever at ~0% CPU. It never
+            // exits, so the watchdog below can only rescue us after the full
+            // deadline. This is the same pipe-deadlock summarize() guards against.
+            let readHandle = sink.fileHandleForReading
+            var captured = Data()
+            let drained = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .utility).async {
+                captured = readHandle.readDataToEndOfFile()
+                drained.signal()
+            }
+
             try p.run()
 
             let finished = waitOrKill(p, timeout: deadline)
-            lastLog = String(data: sink.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            drained.wait()   // whisper's write end is now closed -> read hit EOF
+            lastLog = String(data: captured, encoding: .utf8) ?? ""
 
             if finished && p.terminationStatus == 0 { break }
             if !finished {
